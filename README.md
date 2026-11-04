@@ -21,7 +21,6 @@
 | 3. | Kaira Meilasya Nayada | H1H024020 | Anggota |
 | 4. | Nursyafika | H1H024023 | Anggota |
 
-
 ## Deskripsi Proyek
 
 Smart Product Counter merupakan sistem penghitung dan pemantau jumlah stok barang berbasis Internet of Things (IoT). Sistem menggunakan mikrokontroler ESP8266 sebagai pusat pengendali dan sensor ultrasonik HC-SR04 untuk mendeteksi keberadaan objek/barang. Jumlah barang yang terdeteksi akan dihitung secara otomatis, ditampilkan melalui LCD 16×2, serta dikirimkan melalui komunikasi MQTT.
