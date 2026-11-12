@@ -189,3 +189,4 @@ Untuk meningkatkan kapabilitas sistem dari purwarupa dasar menuju standar otomas
 
 4. **Notifikasi Instan ke Perangkat Seluler:**
    Menambahkan integrasi bot **Telegram** atau **WhatsApp** agar operator gudang menerima pesan otomatis begitu target batch produksi tercapai.
+   
