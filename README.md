@@ -164,8 +164,6 @@ Progres pengerjaan proyek **Smart Product Counter** hingga saat ini:
 
 * \[x\] Perakitan rangkaian perangkat keras (ESP8266, HC-SR04, LCD I2C, Push Button, LED, Buzzer).
 
-* \[x\] Implementasi logika pembacaan jarak sensor ultrasonik ($\le 15\text{ cm}$) dengan pencegahan *double counting*.
-
 * \[x\] Integrasi output lokal pada LCD 16×2, LED indikator, dan Buzzer.
 
 * \[x\] Konfigurasi koneksi WiFi dan komunikasi dua arah dengan broker publik HiveMQ.
