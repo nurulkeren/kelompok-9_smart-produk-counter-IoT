@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Conveyor Dashboard - Kel 9 IoT</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --blue: #3b82f6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 24px; }
+    .container { max-width: 1100px; margin: 0 auto; }
+
+    header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 1.5rem; font-weight: 700; }
+    header p { color: var(--muted); font-size: 0.9rem; }
+
+    .badge {
+      padding: 6px 14px; border-radius: 999px; font-size: 0.85rem; font-weight: 600;
+      background: #334155; color: var(--text);
+    }
+    .badge.online { background: rgba(34, 197, 94, 0.2); color: var(--green); border: 1px solid var(--green); }
+    .badge.offline { background: rgba(239, 68, 68, 0.2); color: var(--red); border: 1px solid var(--red); }
+
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px; margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 20px;
+    }
+    .card-label { color: var(--muted); font-size: 0.85rem; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card-value { font-size: 1.9rem; font-weight: 700; word-break: break-all; }
+    .sub-info { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
+
+    .status-running { color: var(--green); }
+    .status-scanning, .status-wait_scan { color: var(--yellow); }
+    .status-off, .status-saklar_off { color: var(--red); }
+
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px;
+    }
+    button {
+      border: none; border-radius: 8px; padding: 10px 16px; font-size: 0.9rem;
+      font-weight: 600; cursor: pointer; transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.85; }
+    .btn-on { background: var(--green); color: #0f172a; }
+    .btn-off { background: var(--red); color: #fff; }
+    .btn-wait { background: var(--yellow); color: #0f172a; }
+    .btn-resume { background: #38bdf8; color: #0f172a; }
+    .btn-reset { background: #475569; color: #fff; }
+    .btn-export { background: var(--blue); color: #fff; margin-left: auto; }
+
+    .table-wrap {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; overflow: hidden;
+    }
+    .table-header {
+      padding: 16px 20px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: 12px 20px; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+    th { color: var(--muted); font-weight: 600; background: rgba(15, 23, 42, 0.4); }
+    tr:last-child td { border-bottom: none; }
+    .empty-row { text-align: center; color: var(--muted); padding: 28px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>Smart Automated Conveyor</h1>
+        <p>Monitoring QR/Barcode, Kendali PID & Penghitung Barang (Kelompok 9)</p>
+      </div>
+      <span id="mqtt-status" class="badge offline">Menghubungkan MQTT...</span>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-label">Status Konveyor</div>
+        <div id="status-motor" class="card-value status-off">OFF</div>
+        <div id="status-saklar" class="sub-info">Saklar Fisik: OFF | Sistem: OFF</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Kecepatan Motor (PID)</div>
+        <div class="card-value"><span id="nilai-rpm">0.0</span> <span style="font-size:1rem;color:var(--muted)">RPM</span></div>
+        <div id="info-pid" class="sub-info">Target: 100 RPM | PWM: 0</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Total Barang</div>
+        <div id="total-barang" class="card-value" style="color:var(--blue)">0</div>
+        <div class="sub-info">Terhitung otomatis oleh kamera</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Scan Terakhir</div>
+        <div id="kode-terakhir" class="card-value" style="font-size:1.35rem">-</div>
+        <div id="waktu-terakhir" class="sub-info">Menunggu objek melintas</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="btn-on" onclick="kirimKontrol('ON')">ON Konveyor</button>
+      <button class="btn-off" onclick="kirimKontrol('OFF')">OFF Konveyor</button>
+      <button class="btn-wait" onclick="kirimKontrol('WAIT_SCAN')">Tahan (Belum Scan)</button>
+      <button class="btn-resume" onclick="kirimKontrol('SCAN_OK')">Lanjut (Scan OK)</button>
+      <button class="btn-reset" onclick="resetHitungan()">Reset Barang</button>
+      <button class="btn-export" onclick="exportCSV()">Unduh Log (.CSV)</button>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-header">
+        <strong>Riwayat Pemindaian Barang</strong>
+        <span id="jumlah-log" style="color:var(--muted);font-size:0.85rem">0 data</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>No</th>
+            <th>Waktu</th>
+            <th>Isi QR / Barcode</th>
+            <th>Tipe Kode</th>
+          </tr>
+        </thead>
+        <tbody id="tabel-log">
+          <tr><td colspan="4" class="empty-row">Belum ada barang yang dipindai.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const BROKER_URL = "ws://192.168.137.230:9001";
+    const TOPICS = {
+      kontrol: "kel9_iot/conveyor/kontrol",
+      status:  "kel9_iot/conveyor/status",
+      kode:    "kel9_iot/conveyor/kode",
+      jumlah:  "kel9_iot/conveyor/jumlah",
+      data:    "kel9_iot/conveyor/data",
+      reset:   "kel9_iot/conveyor/reset"
+    };
+
+    const riwayatScan = [];
+    const client = mqtt.connect(BROKER_URL, {
+      clientId: "Dashboard-Kel9-" + Math.random().toString(16).substring(2, 8)
+    });
+
+    const badgeEl = document.getElementById("mqtt-status");
+
+    client.on("connect", () => {
+      badgeEl.textContent = "Terhubung (Raspberry Pi)";
+      badgeEl.className = "badge online";
+      client.subscribe([TOPICS.status, TOPICS.kode, TOPICS.jumlah, TOPICS.data]);
+    });
+
+    client.on("close", () => {
+      badgeEl.textContent = "Terputus";
+      badgeEl.className = "badge offline";
+    });
+
+    client.on("message", (topic, message) => {
+      const payload = message.toString();
+
+      if (topic === TOPICS.status) {
+        try {
+          const data = JSON.parse(payload);
+          const statusEl = document.getElementById("status-motor");
+          statusEl.textContent = data.status;
+          statusEl.className = "card-value status-" + data.status.toLowerCase();
+
+          document.getElementById("status-saklar").textContent =
+            `Saklar Fisik: ${data.saklar} | Sistem: ${data.sistem}`;
+          document.getElementById("nilai-rpm").textContent = Number(data.rpm).toFixed(1);
+          document.getElementById("info-pid").textContent =
+            `Target: ${data.setpoint} RPM | PWM: ${data.pwm}`;
+        } catch (e) {}
+      }
+
+      if (topic === TOPICS.jumlah) {
+        document.getElementById("total-barang").textContent = payload;
+      }
+
+      if (topic === TOPICS.kode) {
+        document.getElementById("kode-terakhir").textContent = payload;
+      }
+
+      if (topic === TOPICS.data) {
+        try {
+          const item = JSON.parse(payload);
+          document.getElementById("kode-terakhir").textContent = item.kode;
+          document.getElementById("waktu-terakhir").textContent = "Pukul " + item.waktu + " (" + item.tipe + ")";
+          document.getElementById("total-barang").textContent = item.jumlah;
+          tambahBarisTabel(item);
+        } catch (e) {}
+      }
+    });
+
+    function tambahBarisTabel(item) {
+      const tbody = document.getElementById("tabel-log");
+      if (riwayatScan.length === 0) tbody.innerHTML = "";
+
+      riwayatScan.unshift(item);
+      document.getElementById("jumlah-log").textContent = riwayatScan.length + " data";
+
+      const tr = document.createElement("tr");
+      const tdNo = document.createElement("td");
+      const tdWaktu = document.createElement("td");
+      const tdKode = document.createElement("td");
+      const tdTipe = document.createElement("td");
+
+      tdNo.textContent = item.jumlah;
+      tdWaktu.textContent = item.waktu;
+      tdKode.textContent = item.kode;
+      tdKode.style.fontWeight = "600";
+      tdTipe.textContent = item.tipe;
+
+      tr.append(tdNo, tdWaktu, tdKode, tdTipe);
+      tbody.prepend(tr);
+    }
+
+    function kirimKontrol(perintah) {
+      client.publish(TOPICS.kontrol, perintah);
+    }
+
+    function resetHitungan() {
+      if (confirm("Reset hitungan jumlah barang kembali ke 0?")) {
+        client.publish(TOPICS.reset, "RESET");
+        riwayatScan.length = 0;
+        document.getElementById("jumlah-log").textContent = "0 data";
+        document.getElementById("kode-terakhir").textContent = "-";
+        document.getElementById("waktu-terakhir").textContent = "Hitungan di-reset";
+        document.getElementById("tabel-log").innerHTML =
+          '<tr><td colspan="4" class="empty-row">Belum ada barang yang dipindai.</td></tr>';
+      }
+    }
+
+    function exportCSV() {
+      if (riwayatScan.length === 0) {
+        alert("Belum ada data pemindaian untuk diunduh.");
+        return;
+      }
+      let csv = "No,Waktu,Kode,Tipe\n";
+      riwayatScan.slice().reverse().forEach(r => {
+        csv += `${r.jumlah},"${r.waktu}","${r.kode.replace(/"/g, '""')}","${r.tipe}"\n`;
+      });
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "log_conveyor_kel9.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
