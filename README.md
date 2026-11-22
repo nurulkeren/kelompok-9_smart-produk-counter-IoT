@@ -1,4 +1,4 @@
-```markdown
+
 # SMART CONVEYOR CONTROL & TRACEABILITY SYSTEM
 
 **Sistem Kendali Kecepatan Sabuk Berbasis PID, Pemindaian Barcode/QR *Computer Vision*, dan Monitoring Produksi *Real-Time* Berbasis IoT**
@@ -187,4 +187,3 @@ $$\text{RPM}_{\text{filtered}}(k) = 0,6 \cdot \text{RPM}_{\text{aktual}}(k) + 0,
 
 ```
 
-```
