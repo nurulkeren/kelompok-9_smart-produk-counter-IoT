@@ -12,7 +12,10 @@ class DashboardController extends Controller
 {
     public function index(Request $request)
     {
-        $query = ScanLog::with(['batch', 'product'])->latest('waktu_scan');
+        // Tabel Audit Traceability HANYA menampilkan barang VALID (tanpa NO_BARCODE)
+        $query = ScanLog::with(['batch', 'product'])
+            ->where('status_scan', 'VALID')
+            ->latest('waktu_scan');
 
         if ($request->filled('search')) {
             $s = $request->search;
@@ -21,10 +24,6 @@ class DashboardController extends Controller
                   ->orWhereHas('product', fn($p) => $p->where('nama_produk', 'like', "%{$s}%"))
                   ->orWhereHas('batch', fn($b) => $b->where('batch_code', 'like', "%{$s}%"));
             });
-        }
-
-        if ($request->filled('status')) {
-            $query->where('status_scan', $request->status);
         }
 
         if ($request->filled('batch_id')) {
@@ -38,6 +37,7 @@ class DashboardController extends Controller
         $totalSemua  = $totalValid + $totalFailed;
         $akurasi     = $totalSemua > 0 ? round(($totalValid / $totalSemua) * 100, 1) : 100;
 
+        // Visualisasi grafik tetap memuat barang VALID dan tanpa barcode (FAILED)
         $chartRows = ScanLog::select(
                 DB::raw("DATE_FORMAT(waktu_scan, '%H:00') as jam"),
                 DB::raw("SUM(CASE WHEN status_scan = 'VALID' THEN 1 ELSE 0 END) as valid_count"),
@@ -55,6 +55,54 @@ class DashboardController extends Controller
             'logs', 'totalValid', 'totalFailed', 'akurasi',
             'chartRows', 'batches', 'products'
         ));
+    }
+
+    public function liveData()
+    {
+        $totalValid  = ScanLog::where('status_scan', 'VALID')->count();
+        $totalFailed = ScanLog::where('status_scan', 'FAILED')->count();
+        $latestValid = ScanLog::where('status_scan', 'VALID')->latest('waktu_scan')->first();
+
+        // Audit Traceability hanya mengambil yang VALID
+        $logs = ScanLog::with(['batch', 'product'])
+            ->where('status_scan', 'VALID')
+            ->latest('waktu_scan')
+            ->limit(10)
+            ->get()
+            ->map(fn($l) => [
+                'waktu'       => $l->waktu_scan?->format('d M Y, H:i:s'),
+                'uid_barcode' => $l->uid_barcode,
+                'batch_code'  => $l->batch->batch_code ?? '-',
+                'nama_produk' => $l->product->nama_produk ?? 'Umum / Non-Master',
+                'tipe_kode'   => $l->tipe_kode,
+                'rpm'         => number_format($l->rpm_saat_scan, 1),
+            ]);
+
+        $chartRows = ScanLog::select(
+                DB::raw("DATE_FORMAT(waktu_scan, '%H:00') as jam"),
+                DB::raw("SUM(CASE WHEN status_scan = 'VALID' THEN 1 ELSE 0 END) as valid_count"),
+                DB::raw("SUM(CASE WHEN status_scan = 'FAILED' THEN 1 ELSE 0 END) as failed_count")
+            )
+            ->whereDate('waktu_scan', today())
+            ->groupBy('jam')
+            ->orderBy('jam')
+            ->get();
+
+        return response()->json([
+            'totalValid'  => $totalValid,
+            'totalFailed' => $totalFailed,
+            'lastUid'     => $latestValid->uid_barcode ?? '-',
+            'logs'        => $logs,
+            'chartLabels' => $chartRows->pluck('jam'),
+            'chartValid'  => $chartRows->pluck('valid_count')->map(fn($v) => (int) $v),
+            'chartFailed' => $chartRows->pluck('failed_count')->map(fn($v) => (int) $v),
+        ]);
+    }
+
+    public function resetLogs()
+    {
+        ScanLog::truncate();
+        return response()->json(['status' => 'ok']);
     }
 
     public function storeBatch(Request $request)
@@ -82,13 +130,12 @@ class DashboardController extends Controller
 
     public function exportCsv(Request $request)
     {
-        $query = ScanLog::with(['batch', 'product'])->latest('waktu_scan');
+        $query = ScanLog::with(['batch', 'product'])
+            ->where('status_scan', 'VALID')
+            ->latest('waktu_scan');
 
         if ($request->filled('search')) {
             $query->where('uid_barcode', 'like', "%{$request->search}%");
-        }
-        if ($request->filled('status')) {
-            $query->where('status_scan', $request->status);
         }
         if ($request->filled('batch_id')) {
             $query->where('batch_id', $request->batch_id);

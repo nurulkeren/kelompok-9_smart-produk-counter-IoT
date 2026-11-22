@@ -34,16 +34,18 @@ class MqttConveyorWorker extends Command
             }
 
             $uid = trim($data['uid_barcode']);
-            $statusScan = strtoupper($data['status_scan'] ?? 'VALID');
+            $statusScan = strtoupper(trim($data['status_scan'] ?? 'VALID'));
             $batchId = null;
             $productId = null;
 
-            $parts = explode('-', $uid);
-            if (count($parts) >= 2) {
-                $batch = Batch::where('batch_code', $parts[0])->first();
-                $product = Product::where('product_code', $parts[1])->first();
-                $batchId = $batch?->id;
-                $productId = $product?->id;
+            if ($statusScan === 'VALID') {
+                $parts = explode('-', $uid);
+                if (count($parts) >= 2) {
+                    $batch = Batch::where('batch_code', strtoupper(trim($parts[0])))->first();
+                    $product = Product::where('product_code', strtoupper(trim($parts[1])))->first();
+                    $batchId = $batch?->id;
+                    $productId = $product?->id;
+                }
             }
 
             if (!$batchId) {
