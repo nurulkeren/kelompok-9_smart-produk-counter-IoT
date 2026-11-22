@@ -41,9 +41,9 @@ Integrasi ketiga subsistem memungkinkan konveyor melakukan pengaturan kecepatan 
 
 | No. | Nama Lengkap | NIM | Peran |
 |:---:|---|:---:|---|
-| 1 | Nurul Maftuhah | H1H024002 | Ketua Kelompok |
+| 1 | Nurul Maftuhah | H1H024002 | Anggota |
 | 2 | Difa' Tamaya Maulidina Adz dzikro | H1H024019 | Anggota |
-| 3 | Kaira Meilasya Nayada | H1H024020 | Anggota |
+| 3 | Kaira Meilasya Nayada | H1H024020 | Ketua Kelompok |
 | 4 | Nursyafika | H1H024023 | Anggota |
 
 ### Academic Information
