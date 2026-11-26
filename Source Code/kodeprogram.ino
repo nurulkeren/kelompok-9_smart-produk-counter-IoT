@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
+// ================= KONFIGURASI WIFI & MQTT =================
 const char* WIFI_SSID   = "naye";
 const char* WIFI_PASS   = "tolonglahya";
 const char* MQTT_SERVER = "192.168.137.230";
@@ -14,6 +15,7 @@ const char* TOPIC_KODE    = "kel9_iot/conveyor/kode";
 const char* TOPIC_JUMLAH  = "kel9_iot/conveyor/jumlah";
 const char* TOPIC_RESET   = "kel9_iot/conveyor/reset";
 
+// ================= PIN ESP8266 =================
 #define PIN_RELAY       D0
 #define PIN_LCD_SDA     D2
 #define PIN_LCD_SCL     D1
@@ -23,11 +25,14 @@ const char* TOPIC_RESET   = "kel9_iot/conveyor/reset";
 #define PIN_LED_MERAH   D3
 #define PIN_LED_HIJAU   D4
 #define PIN_LED_KUNING  D8
+
+// Polaritas LED
 #define LED_ON          LOW
 #define LED_OFF         HIGH
 #define LED_KUNING_ON   HIGH
 #define LED_KUNING_OFF  LOW
 
+// ================= KONFIGURASI KONVEYOR & PID =================
 const int JUMLAH_CELAH = 20;
 
 float setpointRPM = 100.0;
@@ -38,13 +43,14 @@ float Kd = 0.05;
 const int PWM_MIN = 85;
 const int PWM_MAX = 255;
 
+// ================= STATUS OPERASI & DATA LCD =================
 enum ModeKonveyor {
   MODE_RUNNING,
   MODE_SCANNING
 };
 
 ModeKonveyor modeSekarang = MODE_RUNNING;
-bool konveyorAktif = false;     
+bool konveyorAktif = false;      // Bisa langsung di-ON/OFF dari web tanpa saklar fisik
 bool saklarSebelumnya = false;
 bool inisialisasiSaklar = false;
 
@@ -53,6 +59,7 @@ String kodeTerakhirLCD = "-";
 unsigned long waktuNotifStatus = 0;
 String teksNotifStatus = "";
 
+// ================= OBJEK & VARIABEL =================
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -72,6 +79,7 @@ float errorSebelumnya = 0.0;
 int   pwmOutput = 0;
 bool  motorSedangJalan = false;
 
+// ================= HELPER LCD & KEDIP ALERT =================
 void cetakBarisLCD(int baris, String teks) {
   while (teks.length() < 16) teks += " ";
   if (teks.length() > 16) teks = teks.substring(0, 16);
@@ -85,9 +93,10 @@ void setSemuaLED(bool merah, bool kuning, bool hijau) {
   digitalWrite(PIN_LED_HIJAU, hijau ? LED_ON : LED_OFF);
 }
 
+// Alert 5 detik tanpa barcode: LED kedip 2x + LCD tampil "NO BARCODE!" & hitungan tetap muncul
 void jalankanAlertGagalScan() {
-  cetakBarisLCD(0, "ALERT: NO BARCD!");
-  cetakBarisLCD(1, "OTOMATIS LANJUT ");
+  cetakBarisLCD(0, "NO BARCODE!     ");
+  cetakBarisLCD(1, "BRG:" + String(jumlahBarangLCD) + " RPM:0");
 
   for (int i = 0; i < 2; i++) {
     setSemuaLED(true, true, true);
@@ -96,11 +105,12 @@ void jalankanAlertGagalScan() {
     delay(200);
   }
 
-  teksNotifStatus = "NO BARCODE! LANJ";
+  teksNotifStatus = "NO BARCODE!     ";
   waktuNotifStatus = millis();
   modeSekarang = MODE_RUNNING;
 }
 
+// ================= INTERRUPT SENSOR FC-03 =================
 void IRAM_ATTR hitungPulsa() {
   unsigned long sekarang = micros();
   if (sekarang - waktuPulsaTerakhir > 1000) {
@@ -109,6 +119,7 @@ void IRAM_ATTR hitungPulsa() {
   }
 }
 
+// ================= KONTROL INDIKATOR 3 LED =================
 void updateIndikatorLED() {
   if (!konveyorAktif) {
     setSemuaLED(true, false, false);
@@ -121,6 +132,7 @@ void updateIndikatorLED() {
   }
 }
 
+// ================= PROSES PERINTAH MQTT & SERIAL =================
 void prosesPerintah(String pesan) {
   pesan.trim();
   String cmd = pesan;
@@ -183,6 +195,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+// ================= KONTROL MOTOR & RELAY =================
 void mulaiMotor() {
   if (!motorSedangJalan) {
     pinMode(PIN_RELAY, OUTPUT);
@@ -213,6 +226,7 @@ void hentikanMotor() {
   }
 }
 
+// ================= KONEKSI WIFI & MQTT =================
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -241,6 +255,7 @@ void cekKoneksiMQTT() {
   }
 }
 
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -281,6 +296,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), hitungPulsa, FALLING);
 }
 
+// ================= LOOP =================
 void loop() {
   cekKoneksiMQTT();
 
@@ -305,6 +321,7 @@ void loop() {
   if (!konveyorAktif) {
     hentikanMotor();
   } else {
+    // Pengaman jika Raspi terputus saat scanning lebih dari 6.5 detik -> otomatis lanjut
     if (modeSekarang == MODE_SCANNING && (millis() - waktuMulaiScan >= 6500)) {
       jalankanAlertGagalScan();
     }
@@ -318,6 +335,7 @@ void loop() {
 
   updateIndikatorLED();
 
+  // 3. Perhitungan Sensor FC-03 & PID setiap 250 ms
   unsigned long sekarang = millis();
   if (sekarang - waktuPIDSebelumnya >= 250) {
     float dt = (sekarang - waktuPIDSebelumnya) / 1000.0;
@@ -349,10 +367,11 @@ void loop() {
     }
   }
 
+  // 4. Update LCD & Kirim Telemetry setiap 500 ms
   if (sekarang - waktuKirimSebelumnya >= 500) {
     waktuKirimSebelumnya = sekarang;
 
-    if (teksNotifStatus != "" && (sekarang - waktuNotifStatus >= 2000)) {
+    if (teksNotifStatus != "" && (sekarang - waktuNotifStatus >= 3000)) {
       teksNotifStatus = "";
     }
 
