@@ -31,12 +31,17 @@ import time
 import json
 import math
 import queue
+import socket
+import subprocess
 import threading
 import numpy as np
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pyzbar.pyzbar import decode
 import paho.mqtt.client as mqtt
+
+# Batasi thread internal OpenCV agar tidak berebut CPU dengan Mosquitto & server stream
+cv2.setNumThreads(2)
 
 # =====================================================
 # KONFIGURASI MQTT, KAMERA & STREAM PREVIEW
@@ -54,7 +59,7 @@ TOPIC_RESET = "kel9_iot/conveyor/reset"
 
 # --- Logika scan ---
 WAKTU_BERHENTI_SCAN = 5.0     # Berhenti maksimal 5 detik untuk scan, lalu otomatis lanjut
-SCAN_HILANG_MAX = 1.0         # Objek yang sedang di-scan hilang > 1 dtk = alarm palsu (tidak dihitung)
+KONTRAS_TRIGGER = 42.0        # Kontras rata-rata objek minimum agar boleh MENGHENTIKAN konveyor (tekstur sabuk lemah)
 GRACE_RESTART = 1.0           # Cooldown deteksi setelah motor start/lanjut (getaran awal)
 
 # --- Filter objek (koordinat frame penuh 640x480) ---
@@ -73,6 +78,8 @@ K_STD = 3.0                   # Pengali std per-piksel hasil kalibrasi
 THR_MAX = 70.0                # Batas atas ambang adaptif
 KONTRAS_MIN = 36.0            # Rata-rata selisih di dalam kontur minimum
 DELTA_LUM_MAX = 60.0          # Batas kompensasi auto-exposure
+TERANG_MIN = 70.0             # Piksel lebih terang dari level sabuk (persentil-25 frame ini) sebesar ini = barang
+PROSES_FPS_MAX = 15           # Batas kecepatan pemrosesan (memberi ruang CPU untuk MQTT & stream)
 ALPHA_JALAN = 0.04            # Kecepatan adaptasi background saat sabuk jalan
 ALPHA_DIAM = 0.01             # Kecepatan adaptasi background saat sabuk diam
 RASIO_PERUBAHAN_GLOBAL = 0.55 # Rasio piksel berubah yang dianggap perubahan cahaya global
@@ -100,18 +107,79 @@ shared = {"jumlah": 0}
 cmd_queue = queue.Queue()          # Perintah dari callback MQTT -> loop utama (thread-safe)
 tracked_objects = {}
 
+# Memori UID yang sudah pernah di-scan VALID (anti-duplikat). Disimpan ke file agar tahan restart skrip,
+# dan dikosongkan saat dashboard mengirim RESET.
+UID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uid_terscan.json")
+
+
+def muat_uid_terscan():
+    try:
+        with open(UID_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+    except (OSError, ValueError):
+        pass
+    return set()
+
+
+uid_terscan = muat_uid_terscan()
+
+
+def simpan_uid_terscan():
+    try:
+        tmp = UID_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(uid_terscan), f)
+        os.replace(tmp, UID_FILE)
+    except OSError as e:
+        print(f"[SISTEM] Gagal menyimpan memori UID: {e}")
+
+
 latest_jpeg = None
 latest_id = 0
 frame_lock = threading.Lock()
 
 
+latest_raw = None
+raw_id = 0
+raw_lock = threading.Lock()
+JPEG_QUALITY = 60
+STREAM_FPS_MAX = 12
+STREAM_LEBAR = 480
+
+
 def kirim_ke_stream(img):
+    """Hanya menyimpan frame preview terbaru (cepat). Encode JPEG dikerjakan thread encoder terpisah."""
+    global latest_raw, raw_id
+    with raw_lock:
+        latest_raw = img
+        raw_id += 1
+
+
+def thread_encoder():
     global latest_jpeg, latest_id
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    if ok:
-        with frame_lock:
-            latest_jpeg = buf.tobytes()
-            latest_id += 1
+    terakhir = -1
+    jeda = 1.0 / STREAM_FPS_MAX
+    while True:
+        with raw_lock:
+            img, rid = latest_raw, raw_id
+        if img is None or rid == terakhir:
+            time.sleep(0.01)
+            continue
+        terakhir = rid
+        if STREAM_LEBAR and img.shape[1] > STREAM_LEBAR:
+            skala_s = STREAM_LEBAR / float(img.shape[1])
+            img = cv2.resize(img, (STREAM_LEBAR, int(img.shape[0] * skala_s)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        if ok:
+            with frame_lock:
+                latest_jpeg = buf.tobytes()
+                latest_id += 1
+        time.sleep(jeda)
+
+
+threading.Thread(target=thread_encoder, daemon=True).start()
 
 
 # =====================================================
@@ -141,6 +209,12 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            try:
+                # Buffer kirim kecil: bila jaringan lambat, frame lama tidak menumpuk (latensi tetap rendah)
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             last_id = -1
             try:
                 while True:
@@ -219,10 +293,73 @@ client.connect_async(BROKER, PORT, 60)
 client.loop_start()
 
 # =====================================================
+# THREAD KAMERA (HANYA FRAME TERBARU -> TANPA LAG BUFFER)
+# =====================================================
+class KameraThread:
+    """Membaca kamera terus-menerus di thread sendiri dan hanya menyimpan frame TERBARU."""
+
+    def __init__(self, cap_obj):
+        self.cap = cap_obj
+        self.lock = threading.Lock()
+        self.frame = None
+        self.id = 0
+        self.jalan = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while self.jalan:
+            ok, f = self.cap.read()
+            if ok and f is not None:
+                with self.lock:
+                    self.frame = f
+                    self.id += 1
+            else:
+                time.sleep(0.01)
+
+    def baca(self, id_terakhir, timeout=1.0):
+        mulai = time.time()
+        while time.time() - mulai < timeout:
+            with self.lock:
+                if self.frame is not None and self.id != id_terakhir:
+                    return True, self.frame, self.id
+            time.sleep(0.002)
+        return False, None, id_terakhir
+
+    def henti(self):
+        self.jalan = False
+        time.sleep(0.15)
+
+
+cam = None
+_id_frame_terakhir = 0
+
+
+def ambil_frame(timeout=1.0):
+    """Ambil frame TERBARU yang belum pernah dibaca (frame lama dibuang)."""
+    global _id_frame_terakhir
+    ok, f, fid = cam.baca(_id_frame_terakhir, timeout)
+    if ok:
+        _id_frame_terakhir = fid
+    return ok, f
+
+
+def setel_kamera_v4l2(dev_path):
+    """Matikan penurunan FPS otomatis saat cahaya redup (exposure_dynamic_framerate) bila v4l2-ctl tersedia."""
+    for perintah in (["--set-ctrl=exposure_dynamic_framerate=0"], ["--set-parm=30"]):
+        try:
+            subprocess.run(["v4l2-ctl", "-d", dev_path] + perintah,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        except Exception:
+            pass
+
+
+# =====================================================
 # DETEKSI OTOMATIS USB WEBCAM
 # =====================================================
 cap = None
 frame_contoh = None
+dev_terpilih = None
+FOURCC_PAKAI = "MJPG" if "--mjpg" in sys.argv else "YUYV"
 
 for idx in range(10):
     dev_path = f"/dev/video{idx}"
@@ -234,7 +371,7 @@ for idx in range(10):
         temp_cap = cv2.VideoCapture(idx)
 
     if temp_cap.isOpened():
-        temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+        temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*FOURCC_PAKAI))
         temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -243,6 +380,7 @@ for idx in range(10):
         if ret_test and frm_test is not None and frm_test.size > 0:
             cap = temp_cap
             frame_contoh = frm_test
+            dev_terpilih = dev_path
             print(f"[KAMERA] Aktif di {dev_path} ({frm_test.shape[1]}x{frm_test.shape[0]})")
             break
 
@@ -252,6 +390,11 @@ if cap is None or not cap.isOpened():
     print("[ERROR] USB Webcam tidak dapat dibuka di /dev/video0..9!")
     sys.exit(1)
 
+setel_kamera_v4l2(dev_terpilih)
+cap.set(cv2.CAP_PROP_FPS, 30)
+print(f"[KAMERA] Format {FOURCC_PAKAI}, FPS dilaporkan driver: {cap.get(cv2.CAP_PROP_FPS):.0f}")
+cam = KameraThread(cap)
+
 # =====================================================
 # GEOMETRI ROI, ZONA TENGAH & SKALA PEMROSESAN
 # =====================================================
@@ -260,15 +403,18 @@ h, w = frame_contoh.shape[:2]
 # ROI murni di atas sabuk hitam. Sisi kanan (x > 65%) adalah dinding/rel logam perak -> dikeluarkan.
 # Atur di sini (fraksi lebar/tinggi frame) ATAU lewat argumen tanpa edit kode:
 #   python3 conveyor_cam.py --grid                       (penggaris 0.1-0.9 di preview)
-#   python3 conveyor_cam.py --roi 0.19,0.62,0.04,0.96 --zona 0.20,0.61,0.10,0.90
+#   python3 conveyor_cam.py --roi 0.16,0.64,0.04,0.96 --zona 0.17,0.63,0.10,0.90
 # Format: x1,x2,y1,y2. ROI = batas sabuk hitam (tanpa dinding/rel). Zona HARUS di dalam ROI.
-ROI_X1, ROI_X2, ROI_Y1, ROI_Y2 = 0.19, 0.62, 0.04, 0.96
-ZONA_X1, ZONA_X2, ZONA_Y1, ZONA_Y2 = 0.20, 0.61, 0.10, 0.90
+ROI_X1, ROI_X2, ROI_Y1, ROI_Y2 = 0.16, 0.64, 0.04, 0.96
+ZONA_X1, ZONA_X2, ZONA_Y1, ZONA_Y2 = 0.17, 0.63, 0.10, 0.90
 
 _parser = argparse.ArgumentParser(description="Smart Conveyor - kamera & scanner")
 _parser.add_argument("--roi", default=None, help="x1,x2,y1,y2 (fraksi 0-1)")
 _parser.add_argument("--zona", default=None, help="x1,x2,y1,y2 (fraksi 0-1)")
 _parser.add_argument("--grid", action="store_true", help="tampilkan penggaris di preview")
+_parser.add_argument("--mjpg", action="store_true", help="pakai format kamera MJPG (sering lebih cepat dari YUYV)")
+_parser.add_argument("--izinkan-duplikat", dest="izinkan_duplikat", action="store_true",
+                     help="izinkan UID yang sama dihitung VALID lebih dari sekali (bawaan: ditolak)")
 _parser.add_argument("--uji", action="store_true",
                      help="mode uji: barang diam/dipegang tangan tetap bisa memicu scan (tanpa syarat gerak)")
 _parser.add_argument("--tes-decode", dest="tes_decode", action="store_true",
@@ -343,7 +489,7 @@ def kalibrasi_sabuk(jumlah_frame=25):
     """Referensi sabuk kosong = median N frame. Peta std per-piksel -> ambang adaptif."""
     kumpulan = []
     for i in range(jumlah_frame):
-        ok, frm = cap.read()
+        ok, frm = ambil_frame()
         if ok and frm is not None:
             kumpulan.append(preproses_roi(cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)))
             tampilkan_info(frm, f"KALIBRASI SABUK KOSONG {i + 1}/{jumlah_frame}")
@@ -447,6 +593,61 @@ def scan_multi_mode(gray_full, obj_box, mode):
             return kode, tipe
 
     return None, None
+
+
+class DecodeWorker:
+    """Decode barcode di thread terpisah supaya loop kamera/preview tidak tertahan."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.job = None
+        self.sibuk = False
+        self.hasil = None
+        self.generasi = 0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            self.event.wait()
+            self.event.clear()
+            with self.lock:
+                job = self.job
+            if job is None:
+                continue
+            gray, box, mode, gen = job
+            try:
+                kode, tipe = scan_multi_mode(gray, box, mode)
+            except Exception as e:
+                print(f"[DECODE] Error: {e}")
+                kode, tipe = None, None
+            with self.lock:
+                if gen == self.generasi:
+                    self.hasil = (kode, tipe)
+                self.sibuk = False
+
+    def reset(self):
+        with self.lock:
+            self.generasi += 1
+            self.hasil = None
+
+    def kirim(self, gray, box, mode):
+        with self.lock:
+            if self.sibuk:
+                return False
+            self.sibuk = True
+            self.job = (gray, box, mode, self.generasi)
+        self.event.set()
+        return True
+
+    def ambil(self):
+        with self.lock:
+            h_ = self.hasil
+            self.hasil = None
+            return h_
+
+
+decode_worker = DecodeWorker()
 
 
 # =====================================================
@@ -561,6 +762,8 @@ def perbarui_tracking(deteksi, sekarang, next_id, kunci_zona):
 
     for oid, idxs in cocok.items():
         terapkan_deteksi(tracked_objects[oid], [deteksi[i]["box"] for i in idxs], sekarang)
+        kmax = max(deteksi[i]["kontras"] for i in idxs)
+        tracked_objects[oid]["kontras"] = 0.6 * tracked_objects[oid]["kontras"] + 0.4 * kmax
 
     # Pass C
     for i, det in enumerate(deteksi):
@@ -590,10 +793,15 @@ def perbarui_tracking(deteksi, sekarang, next_id, kunci_zona):
             "done_time": None,
             "vel": (0.0, 0.0),
             "jarak_maks": 0.0,
+            "kontras": det["kontras"],
         }
         next_id += 1
 
     return next_id
+
+
+def ts():
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
 def ambil_rpm(data_pid):
@@ -619,6 +827,14 @@ def publish_valid(kode, tipe, jumlah, rpm):
     })
     client.publish(TOPIC_DATA, payload, qos=1)
     print(f"[{waktu_str}] SCAN VALID: {kode} | Total LCD: {jumlah} -> Lanjut jalan!")
+
+
+def publish_duplikat(kode):
+    """UID sudah pernah di-scan: konveyor lanjut, TIDAK dihitung dan TIDAK dikirim ke dashboard/database."""
+    waktu_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    client.publish(TOPIC_KONTROL, "SCAN_OK", qos=1)
+    client.publish(TOPIC_KONTROL, "ON", qos=1)
+    print(f"[{waktu_str}] DUPLIKAT: {kode} sudah pernah di-scan -> tidak dihitung & tidak dikirim ke dashboard. Konveyor lanjut.")
 
 
 def publish_gagal(jumlah, rpm):
@@ -654,6 +870,8 @@ def alasan_belum_scan(obj, sekarang, konveyor_aktif, sedang_scanning, menunggu_k
         return "STABIL (waktu)"
     if not ARGS.uji and obj["jarak_maks"] < MIN_JARAK_GERAK:
         return f"DIAM {obj['jarak_maks']:.0f}/{MIN_JARAK_GERAK}px"
+    if not ARGS.uji and obj["kontras"] < KONTRAS_TRIGGER:
+        return f"KONTRAS RENDAH {obj['kontras']:.0f}/{KONTRAS_TRIGGER:.0f}"
     if not titik_dalam_zona(obj["center"]):
         return "DI LUAR ZONA"
     if not box_utuh_di_roi(obj["box"]) and not titik_dalam_zona_inti(obj["center"]):
@@ -668,7 +886,7 @@ def mode_tes_decode():
     terakhir_teks, terakhir_waktu = "", 0.0
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = ambil_frame()
             if not ok or frame is None:
                 time.sleep(0.03)
                 continue
@@ -698,6 +916,7 @@ def mode_tes_decode():
     except KeyboardInterrupt:
         print("\n[TES-DECODE] Selesai.")
     finally:
+        cam.henti()
         cap.release()
         client.loop_stop()
         client.disconnect()
@@ -714,6 +933,9 @@ def main():
     print("[KALIBRASI] Mengambil referensi sabuk kosong (median 25 frame)...")
     bg_ref, thr_map = kalibrasi_sabuk()
     print("[SISTEM] Siap! Klik Jalankan (ON) di dashboard untuk memulai.")
+    if not ARGS.izinkan_duplikat:
+        print(f"[SISTEM] Anti-duplikat UID AKTIF ({len(uid_terscan)} UID tersimpan dari sesi sebelumnya). "
+              f"Klik RESET di dashboard untuk mengosongkan.")
 
     next_obj_id = 1
     data_pid = {"status": "OFF", "rpm": 0.0, "setpoint": 100.0, "pwm": 0}
@@ -734,10 +956,14 @@ def main():
     gagal_baca = 0
     fps = 10.0
     waktu_frame_prev = 0.0
+    status_terakhir = ""
+    waktu_stat_terakhir = 0.0
+    ms_proses = 0.0
+    cam_id_prev = 0
 
     try:
         while True:
-            ret, frame = cap.read()
+            ret, frame = ambil_frame()
             if not ret or frame is None:
                 gagal_baca += 1
                 if gagal_baca == 100:
@@ -765,6 +991,10 @@ def main():
                     reset_diminta = True
 
                 elif perintah == "KONTROL":
+                    if isi == "ON" and sedang_scanning:
+                        print(f"[{ts()}] [PERINGATAN] Perintah ON diterima SAAT SCANNING "
+                              f"({sekarang - waktu_mulai_scan:.1f}s setelah berhenti). Pi tidak mengirim ON saat scan, "
+                              f"jadi ini dari ESP8266/dashboard -> motor bisa lanjut jalan sebelum 5 dtk!")
                     if isi == "ON":
                         if not konveyor_aktif:
                             konveyor_aktif = True
@@ -785,6 +1015,12 @@ def main():
 
                 elif perintah == "STATUS":
                     data_pid = isi
+                    st_baru = str(data_pid.get("status", ""))
+                    if st_baru != status_terakhir:
+                        print(f"[{ts()}] [ESP] status: '{status_terakhir}' -> '{st_baru}' | "
+                              f"sistem={data_pid.get('sistem')} rpm={data_pid.get('rpm')} pwm={data_pid.get('pwm')} "
+                              f"(scanning={sedang_scanning})")
+                        status_terakhir = st_baru
                     sistem = str(data_pid.get("sistem", "")).upper()
                     if sistem == "ON":
                         if not konveyor_aktif:
@@ -798,6 +1034,8 @@ def main():
                 sedang_scanning_sebelum = sedang_scanning
                 shared["jumlah"] = 0
                 tracked_objects.clear()
+                uid_terscan.clear()
+                simpan_uid_terscan()
                 next_obj_id = 1
                 sedang_scanning = False
                 scanning_obj_id = None
@@ -838,9 +1076,17 @@ def main():
             delta_lum = max(-DELTA_LUM_MAX, min(DELTA_LUM_MAX, delta_lum))
             bg_komp = bg_komp + delta_lum
 
-            selisih = np.abs(roi_blur - bg_komp)
             sumber_norm = (roi_blur - delta_lum) / gain   # frame saat ini dinormalkan ke exposure referensi
-            fg_mask = (selisih > thr_map).astype(np.uint8) * 255
+
+            # Deteksi SATU ARAH: barang selalu LEBIH TERANG dari sabuk hitam. Area yang lebih gelap dari
+            # referensi (referensi terkontaminasi benda saat kalibrasi, bayangan) tidak dianggap objek.
+            selisih_bg = np.maximum(roi_blur - bg_komp, 0.0)
+            # Kanal kecerahan absolut (tidak bergantung referensi): sabuk = persentil-25 frame ini
+            level_sabuk = float(np.percentile(roi_blur, 25))
+            selisih_terang = np.maximum(roi_blur - level_sabuk, 0.0)
+            fg_terang = selisih_terang > TERANG_MIN
+            selisih = np.maximum(selisih_bg, np.where(fg_terang, selisih_terang, 0.0)).astype(np.float32)
+            fg_mask = ((selisih_bg > thr_map) | fg_terang).astype(np.uint8) * 255
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_open)
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close)
             rasio_perubahan = cv2.countNonZero(fg_mask) / px_total
@@ -855,6 +1101,11 @@ def main():
                 bx, by, bw, bh = cv2.boundingRect(c)
                 if min(bw, bh) < sisi_min_kecil:
                     continue
+                # Tolak strip tipis memanjang yang menempel tepi ROI (bayangan/pantulan tepi sabuk)
+                menempel_tepi = bx <= 2 or by <= 2 or (bx + bw) >= sw - 2 or (by + bh) >= sh - 2
+                rasio_aspek = max(bw, bh) / float(max(1, min(bw, bh)))
+                if menempel_tepi and rasio_aspek > 4.0 and not ARGS.uji:
+                    continue
                 # Tolak kotak raksasa seukuran seluruh sabuk (perubahan cahaya global)
                 if bw > (sw * 0.85) and bh > (sh * 0.82) and not ARGS.uji:
                     continue
@@ -862,7 +1113,8 @@ def main():
                     continue
                 mask_kontur = np.zeros((sh, sw), dtype=np.uint8)
                 cv2.drawContours(mask_kontur, [c], -1, 255, -1)
-                if cv2.mean(selisih, mask=mask_kontur)[0] < KONTRAS_MIN:
+                kontras_kontur = float(cv2.mean(selisih, mask=mask_kontur)[0])
+                if kontras_kontur < KONTRAS_MIN:
                     continue
 
                 fx = x1 + int(bx * skala_x)
@@ -871,7 +1123,8 @@ def main():
                 fh = int(bh * skala_y)
                 deteksi_saat_ini.append({
                     "box": (fx, fy, fw, fh),
-                    "center": (fx + fw // 2, fy + fh // 2)
+                    "center": (fx + fw // 2, fy + fh // 2),
+                    "kontras": kontras_kontur
                 })
 
             # ---------- Pelacakan ----------
@@ -884,8 +1137,8 @@ def main():
                         obj, sekarang, konveyor_aktif, sedang_scanning, menunggu_keluar_zona, blok_trigger_hingga)
                     if not obj.get("dilog"):
                         obj["dilog"] = True
-                        print(f"[TRACK] #{oid} terkonfirmasi box={obj['box']} pusat={obj['center']} "
-                              f"fps={fps:.0f} | {obj['alasan_terakhir']}")
+                        print(f"[{ts()}] [TRACK] #{oid} terkonfirmasi box={obj['box']} pusat={obj['center']} "
+                              f"kontras={obj['kontras']:.0f} fps={fps:.0f} | {obj['alasan_terakhir']}")
 
             # ---------- Kedaluwarsa objek ----------
             for oid in list(tracked_objects.keys()):
@@ -899,8 +1152,8 @@ def main():
                     batas = NEW_HILANG_MAX
                 if tak_terlihat > batas:
                     if obj["status"] == "NEW" and obj.get("dilog"):
-                        print(f"[TRACK] #{oid} HILANG tanpa di-scan | alasan terakhir: {obj.get('alasan_terakhir')} "
-                              f"| gerak maks={obj['jarak_maks']:.0f}px | umur={sekarang - obj['spawn_time']:.2f}s "
+                        print(f"[{ts()}] [TRACK] #{oid} HILANG tanpa di-scan | alasan terakhir: {obj.get('alasan_terakhir')} "
+                              f"| kontras={obj['kontras']:.0f} | gerak maks={obj['jarak_maks']:.0f}px | umur={sekarang - obj['spawn_time']:.2f}s "
                               f"| posisi terakhir={obj['center']}")
                     del tracked_objects[oid]
 
@@ -978,6 +1231,8 @@ def main():
                         continue
                     if not ARGS.uji and obj["jarak_maks"] < MIN_JARAK_GERAK:
                         continue
+                    if not ARGS.uji and obj["kontras"] < KONTRAS_TRIGGER:
+                        continue
                     if not titik_dalam_zona(obj["center"]):
                         continue
                     # Berhenti hanya saat barang sudah masuk UTUH ke ROI (barcode tidak terpotong tepi).
@@ -996,8 +1251,10 @@ def main():
                     scanning_obj_id = kandidat_id
                     waktu_mulai_scan = sekarang
                     siklus_scan = 0
+                    decode_worker.reset()
                     client.publish(TOPIC_KONTROL, "SCANNING", qos=1)
-                    print(f"[DETEKSI] Objek #{kandidat_id} tiba di tengah lensa -> Berhenti maksimal 5 detik...")
+                    print(f"[{ts()}] [DETEKSI] Objek #{kandidat_id} tiba di tengah lensa "
+                          f"(kontras={obj['kontras']:.0f}) -> Berhenti maksimal 5 detik...")
 
             # ---------- Proses scan aktif ----------
             teks_status = None
@@ -1006,12 +1263,9 @@ def main():
             if sedang_scanning:
                 obj_aktif = tracked_objects.get(scanning_obj_id)
 
-                if obj_aktif is None or (sekarang - obj_aktif["last_seen"]) > SCAN_HILANG_MAX:
-                    # Objek lenyap saat scanning -> alarm palsu: lanjut jalan, TIDAK dihitung
-                    print(f"[DETEKSI] Objek #{scanning_obj_id} hilang saat scanning "
-                          f"({sekarang - waktu_mulai_scan:.1f}s setelah berhenti) -> alarm palsu, konveyor lanjut tanpa hitung.")
-                    if obj_aktif is not None:
-                        del tracked_objects[scanning_obj_id]
+                if obj_aktif is None:
+                    # Objek tidak ada di tracker (mis. setelah RESET) -> batalkan scan tanpa hitung
+                    print(f"[DETEKSI] Objek #{scanning_obj_id} tidak ada di tracker -> scan dibatalkan tanpa hitung.")
                     sedang_scanning = False
                     scanning_obj_id = None
                     blok_trigger_hingga = sekarang + GRACE_RESTART
@@ -1019,16 +1273,28 @@ def main():
                     if konveyor_aktif:
                         client.publish(TOPIC_KONTROL, "ON", qos=1)
                 else:
+                    if (sekarang - obj_aktif["last_seen"]) > 0.5 and not obj_aktif.get("dilog_hilang"):
+                        obj_aktif["dilog_hilang"] = True
+                        print(f"[{ts()}] [DETEKSI] Objek #{scanning_obj_id} tidak terlihat saat scanning, "
+                              f"tetap scan frame penuh sampai {WAKTU_BERHENTI_SCAN:.0f} dtk.")
                     sisa_waktu = max(0.0, WAKTU_BERHENTI_SCAN - (sekarang - waktu_mulai_scan))
                     teks_status = f"SCAN OBJEK #{scanning_obj_id} ({sisa_waktu:.1f}s)..."
                     warna_status = (0, 255, 255)
 
-                    siklus_scan = (siklus_scan + 1) % JUMLAH_MODE_DECODE
-                    isi_kode, tipe_kode = scan_multi_mode(gray_full, obj_aktif["box"], siklus_scan)
+                    isi_kode, tipe_kode = None, None
+                    hasil_decode = decode_worker.ambil()
+                    if hasil_decode and hasil_decode[0]:
+                        isi_kode, tipe_kode = hasil_decode
+                    if not isi_kode:
+                        # Mode decode hanya maju jika pekerjaan benar-benar diterima worker (tidak sibuk)
+                        mode_berikut = (siklus_scan + 1) % JUMLAH_MODE_DECODE
+                        if decode_worker.kirim(gray_full, obj_aktif["box"], mode_berikut):
+                            siklus_scan = mode_berikut
 
                     if isi_kode:
+                        duplikat = (not ARGS.izinkan_duplikat) and (isi_kode in uid_terscan)
                         obj_aktif["status"] = "DONE_OK"
-                        obj_aktif["label"] = f"OK: {isi_kode}"
+                        obj_aktif["label"] = f"DUPLIKAT: {isi_kode}" if duplikat else f"OK: {isi_kode}"
                         obj_aktif["done_time"] = sekarang
                         sedang_scanning = False
                         scanning_obj_id = None
@@ -1038,8 +1304,13 @@ def main():
                         blok_trigger_hingga = sekarang + GRACE_RESTART
                         waktu_jalan_sejak = sekarang
 
-                        shared["jumlah"] += 1
-                        publish_valid(isi_kode, tipe_kode, shared["jumlah"], ambil_rpm(data_pid))
+                        if duplikat:
+                            publish_duplikat(isi_kode)
+                        else:
+                            uid_terscan.add(isi_kode)
+                            simpan_uid_terscan()
+                            shared["jumlah"] += 1
+                            publish_valid(isi_kode, tipe_kode, shared["jumlah"], ambil_rpm(data_pid))
 
                     elif (sekarang - waktu_mulai_scan) >= WAKTU_BERHENTI_SCAN:
                         obj_aktif["status"] = "DONE_FAIL"
@@ -1098,7 +1369,7 @@ def main():
                 if st == "SCANNING":
                     warna_obj = (0, 255, 255)
                 elif st == "DONE_OK":
-                    warna_obj = (0, 255, 0)
+                    warna_obj = (255, 0, 255) if obj["label"].startswith("DUPLIKAT") else (0, 255, 0)
                 elif st == "DONE_FAIL":
                     warna_obj = (0, 165, 255)
                 else:
@@ -1132,12 +1403,31 @@ def main():
                         (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             kirim_ke_stream(preview)
-            time.sleep(0.005)
+
+            # Statistik diagnosa tiap 3 detik (salin ke chat bila ada masalah)
+            ms_proses = 0.8 * ms_proses + 0.2 * ((time.time() - sekarang) * 1000.0)
+            if sekarang - waktu_stat_terakhir >= 3.0:
+                if waktu_stat_terakhir > 0:
+                    fps_kamera = (cam.id - cam_id_prev) / (sekarang - waktu_stat_terakhir)
+                else:
+                    fps_kamera = 0.0
+                cam_id_prev = cam.id
+                waktu_stat_terakhir = sekarang
+                print(f"[{ts()}] [STAT] fps_kamera={fps_kamera:.0f} fps_proses={fps:.0f} proses={ms_proses:.0f}ms "
+                      f"mqtt={'OK' if client.is_connected() else 'PUTUS'} konveyor={'ON' if konveyor_aktif else 'OFF'} "
+                      f"objek={len(tracked_objects)} scanning={sedang_scanning} lock={menunggu_keluar_zona} "
+                      f"total={shared['jumlah']}")
+
+            # Batasi kecepatan proses; frame lama dibuang oleh thread kamera, jadi tidak menambah lag
+            sisa_jeda = (1.0 / PROSES_FPS_MAX) - (time.time() - sekarang)
+            if sisa_jeda > 0:
+                time.sleep(sisa_jeda)
 
     except KeyboardInterrupt:
         print("\n[SISTEM] Program dihentikan.")
     finally:
         client.publish(TOPIC_KONTROL, "OFF", qos=1)
+        cam.henti()
         cap.release()
         client.loop_stop()
         client.disconnect()
