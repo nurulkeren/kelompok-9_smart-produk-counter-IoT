@@ -1,28 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-conveyor_cam.py - Smart Conveyor Control & Traceability System (Raspberry Pi)
-
-Perbaikan utama dibanding versi sebelumnya:
-  1. Anti false-positive sabuk kosong
-     - ROI dipersempit sehingga dinding/rel logam perak (x > 65%) tidak ikut terbaca.
-     - Referensi sabuk kosong = median 25 frame + peta noise per-piksel (std) -> ambang adaptif.
-     - Kompensasi kecerahan global (auto-exposure) dihitung dari piksel latar saja.
-     - Pemrosesan di resolusi 50% + blur kuat + morfologi OPEN/CLOSE.
-     - Kontur disaring: luas, sisi minimum, fill ratio, dan kontras rata-rata.
-     - Objek baru baru boleh memicu scan jika: stabil >= N frame, >= durasi minimum,
-       dan benar-benar BERGERAK (bukan artefak statis). Artefak statis diserap ke background.
-     - Cooldown setelah motor menyala/lanjut (getaran start tidak memicu deteksi).
-     - Background di-update pelan secara terus-menerus (kecuali area objek).
-  2. Garansi 1 barang = 1x scan
-     - Pelacakan objek dengan prediksi posisi; fragmen kontur milik barang yang sudah
-       selesai (DONE_OK / DONE_FAIL) diserap ke barang itu, bukan jadi barang baru.
-     - Exit-zone lock: scan berikutnya diblokir sampai barang selesai benar-benar
-       meninggalkan zona tengah. Barang selesai TIDAK pernah kedaluwarsa selama masih terlihat.
-
-Topik & payload MQTT sama persis dengan spesifikasi proyek.
-"""
-
 import os
 import sys
 import argparse
@@ -1358,7 +1333,6 @@ def main():
                 st = obj["status"]
 
                 if st == "NEW" and obj["frames_seen"] < MIN_FRAME_STABIL:
-                    # Kandidat belum stabil: gambar tipis abu-abu
                     cv2.rectangle(preview, (fx, fy), (fx + bw, fy + bh), (120, 120, 120), 1)
                     cv2.putText(preview, alasan_belum_scan(obj, sekarang, konveyor_aktif, sedang_scanning,
                                                            menunggu_keluar_zona, blok_trigger_hingga),
